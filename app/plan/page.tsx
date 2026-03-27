@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import SessionCard from "@/components/SessionCard";
-import type { TrainingPlan, Week, Session } from "@/lib/types";
+import type { TrainingPlan, Session } from "@/lib/types";
 
 const DAY_NAMES = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"];
 
@@ -15,17 +15,36 @@ const PHASE_LABELS: Record<string, string> = {
   course: "🏁 Course",
 };
 
-const STATUS_CONFIG = {
-  validee: { label: "✅ Semaine validée", cls: "text-green-400 bg-green-400/10 border-green-800" },
-  partielle: { label: "⚠️ Partiellement faite", cls: "text-yellow-400 bg-yellow-400/10 border-yellow-800" },
-  "a-faire": { label: "📋 À faire", cls: "text-slate-400 bg-slate-400/10 border-slate-700" },
+const SPORT_EMOJIS: Record<string, string> = {
+  marathon: "🏃",
+  "semi-marathon": "🏅",
+  triathlon: "🏊",
+  velo: "🚴",
 };
+
+function getWeekStatus(sessions: Session[]): {
+  label: string;
+  cls: string;
+  done: number;
+  total: number;
+} {
+  const active = sessions.filter((s) => s.type !== "repos");
+  const done = active.filter((s) => !!s.log).length;
+  const total = active.length;
+
+  if (total === 0) return { label: "—", cls: "text-slate-500", done: 0, total: 0 };
+
+  const ratio = done / total;
+  if (ratio === 1) return { label: "✅ Semaine validée", cls: "text-green-400", done, total };
+  if (ratio >= 0.5) return { label: "⚠️ Partiellement faite", cls: "text-yellow-400", done, total };
+  if (ratio > 0) return { label: "🔄 En cours", cls: "text-blue-400", done, total };
+  return { label: "📋 À faire", cls: "text-slate-400", done, total };
+}
 
 export default function PlanPage() {
   const router = useRouter();
   const [plan, setPlan] = useState<TrainingPlan | null>(null);
   const [expandedWeek, setExpandedWeek] = useState<number>(1);
-  const [stravaConnected, setStravaConnected] = useState(false);
 
   useEffect(() => {
     const stored = localStorage.getItem("training-plan");
@@ -33,52 +52,45 @@ export default function PlanPage() {
     setPlan(JSON.parse(stored));
   }, []);
 
-  const handleSessionUpdate = (weekNumber: number, updated: Session) => {
-    if (!plan) return;
-    const newPlan: TrainingPlan = {
-      ...plan,
-      weeks: plan.weeks.map((w) =>
-        w.weekNumber !== weekNumber
-          ? w
-          : {
-              ...w,
-              sessions: w.sessions.map((s) => (s.id === updated.id ? updated : s)),
-              totalDurationMin: w.sessions
-                .map((s) => (s.id === updated.id ? updated : s))
-                .reduce((acc, s) => acc + s.durationMin, 0),
-            }
-      ),
-    };
+  const savePlan = (newPlan: TrainingPlan) => {
     setPlan(newPlan);
     localStorage.setItem("training-plan", JSON.stringify(newPlan));
+  };
+
+  const handleSessionUpdate = (weekNumber: number, updated: Session) => {
+    if (!plan) return;
+    savePlan({
+      ...plan,
+      weeks: plan.weeks.map((w) =>
+        w.weekNumber !== weekNumber ? w : {
+          ...w,
+          sessions: w.sessions.map((s) => (s.id === updated.id ? updated : s)),
+          totalDurationMin: w.sessions
+            .map((s) => (s.id === updated.id ? updated : s))
+            .reduce((acc, s) => acc + s.durationMin, 0),
+        }
+      ),
+    });
   };
 
   const handleSessionDelete = (weekNumber: number, sessionId: string) => {
     if (!plan) return;
-    const newPlan: TrainingPlan = {
+    savePlan({
       ...plan,
       weeks: plan.weeks.map((w) =>
-        w.weekNumber !== weekNumber
-          ? w
-          : {
-              ...w,
-              sessions: w.sessions.filter((s) => s.id !== sessionId),
-              totalDurationMin: w.sessions
-                .filter((s) => s.id !== sessionId)
-                .reduce((acc, s) => acc + s.durationMin, 0),
-            }
+        w.weekNumber !== weekNumber ? w : {
+          ...w,
+          sessions: w.sessions.filter((s) => s.id !== sessionId),
+          totalDurationMin: w.sessions
+            .filter((s) => s.id !== sessionId)
+            .reduce((acc, s) => acc + s.durationMin, 0),
+        }
       ),
-    };
-    setPlan(newPlan);
-    localStorage.setItem("training-plan", JSON.stringify(newPlan));
-  };
-
-  const formatDate = (dateStr: string) => {
-    return new Date(dateStr).toLocaleDateString("fr-FR", {
-      day: "numeric",
-      month: "short",
     });
   };
+
+  const formatDate = (d: string) =>
+    new Date(d).toLocaleDateString("fr-FR", { day: "numeric", month: "short" });
 
   const formatDuration = (min: number) => {
     const h = Math.floor(min / 60);
@@ -93,67 +105,64 @@ export default function PlanPage() {
       <div className="min-h-screen bg-slate-950 flex items-center justify-center text-white">
         <div className="text-center">
           <div className="text-4xl mb-4">⏳</div>
-          <p className="text-slate-400">Chargement du plan...</p>
+          <p className="text-slate-400">Chargement...</p>
         </div>
       </div>
     );
   }
 
-  const SPORT_EMOJIS: Record<string, string> = {
-    marathon: "🏃",
-    "semi-marathon": "🏅",
-    triathlon: "🏊",
-    velo: "🚴",
-  };
+  // Stats globales
+  const allActive = plan.weeks.flatMap((w) => w.sessions.filter((s) => s.type !== "repos"));
+  const allDone = allActive.filter((s) => !!s.log);
+  const totalLoggedMin = allDone.reduce((acc, s) => acc + (s.log?.durationMin ?? 0), 0);
 
   return (
     <main className="min-h-screen bg-slate-950 text-white">
       {/* Header */}
-      <div className="sticky top-0 z-10 bg-slate-950/95 backdrop-blur border-b border-slate-800 px-4 py-4">
+      <div className="sticky top-0 z-10 bg-slate-950/95 backdrop-blur border-b border-slate-800 px-4 py-3">
         <div className="max-w-3xl mx-auto flex items-center justify-between">
           <div>
-            <h1 className="text-xl font-bold">
+            <h1 className="text-lg font-bold">
               {SPORT_EMOJIS[plan.sport]} Plan {plan.sport.charAt(0).toUpperCase() + plan.sport.slice(1)}
             </h1>
-            <p className="text-slate-400 text-sm">
+            <p className="text-slate-400 text-xs">
               {plan.totalWeeks} semaines · Course le{" "}
               {new Date(plan.eventDate).toLocaleDateString("fr-FR", {
-                day: "numeric",
-                month: "long",
-                year: "numeric",
+                day: "numeric", month: "long", year: "numeric",
               })}
             </p>
           </div>
-          <div className="flex gap-2">
-            {!stravaConnected ? (
-              <a
-                href="/api/strava/auth"
-                className="text-xs px-3 py-2 rounded-xl bg-orange-600 hover:bg-orange-500 transition-colors text-white font-medium"
-              >
-                🔗 Connecter Strava
-              </a>
-            ) : (
-              <span className="text-xs px-3 py-2 rounded-xl bg-green-800/40 text-green-400 border border-green-800">
-                ✓ Strava connecté
-              </span>
-            )}
-            <button
-              onClick={() => router.push("/")}
-              className="text-xs px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 transition-colors"
-            >
-              Nouveau plan
-            </button>
+          <button
+            onClick={() => router.push("/")}
+            className="text-xs px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 transition-colors"
+          >
+            Nouveau plan
+          </button>
+        </div>
+
+        {/* Barre de progression globale */}
+        <div className="max-w-3xl mx-auto mt-2">
+          <div className="flex justify-between text-xs text-slate-500 mb-1">
+            <span>{allDone.length} / {allActive.length} séances complétées</span>
+            <span>{formatDuration(totalLoggedMin)} enregistrés</span>
+          </div>
+          <div className="h-1.5 bg-slate-800 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-orange-500 rounded-full transition-all duration-500"
+              style={{ width: `${allActive.length > 0 ? (allDone.length / allActive.length) * 100 : 0}%` }}
+            />
           </div>
         </div>
       </div>
 
-      {/* Weeks */}
+      {/* Liste des semaines */}
       <div className="max-w-3xl mx-auto px-4 py-6 space-y-3">
         {plan.weeks.map((week) => {
           const isExpanded = expandedWeek === week.weekNumber;
           const sessionsByDay = DAY_NAMES.map((_, i) =>
             week.sessions.filter((s) => s.day === i)
           );
+          const status = getWeekStatus(week.sessions);
 
           return (
             <div
@@ -161,68 +170,73 @@ export default function PlanPage() {
               className={`rounded-2xl border transition-all duration-200 overflow-hidden
                 ${isExpanded ? "border-orange-800/50 bg-slate-900/80" : "border-slate-800 bg-slate-900/40"}`}
             >
-              {/* Week header */}
+              {/* En-tête semaine */}
               <button
                 onClick={() => setExpandedWeek(isExpanded ? -1 : week.weekNumber)}
-                className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-slate-800/50 transition-colors"
+                className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-slate-800/40 transition-colors"
               >
                 <div className="flex items-center gap-3">
-                  <span className="text-slate-500 text-sm font-mono w-6">
-                    {week.weekNumber}
-                  </span>
+                  <span className="text-slate-600 text-sm font-mono w-5">{week.weekNumber}</span>
                   <div>
                     <div className="flex items-center gap-2 flex-wrap">
-                      <span className="text-sm font-semibold">
-                        {formatDate(week.startDate)}
-                      </span>
+                      <span className="text-sm font-semibold">{formatDate(week.startDate)}</span>
                       <span className="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300">
-                        {PHASE_LABELS[week.phase] ?? week.phase}
+                        {PHASE_LABELS[week.phase]}
                       </span>
                     </div>
-                    <div className="text-slate-500 text-xs mt-0.5">
-                      {formatDuration(week.totalDurationMin)} ·{" "}
-                      {week.sessions.filter((s) => s.type !== "repos").length} séances
+                    <div className="flex items-center gap-2 mt-0.5">
+                      <span className="text-slate-500 text-xs">
+                        {formatDuration(week.totalDurationMin)} · {status.total} séances
+                      </span>
+                      {status.total > 0 && (
+                        <span className={`text-xs font-medium ${status.cls}`}>
+                          {status.label}
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>
-                <span className="text-slate-500 text-lg">
-                  {isExpanded ? "▲" : "▼"}
-                </span>
+
+                {/* Mini progress bar */}
+                <div className="flex items-center gap-2">
+                  {status.total > 0 && (
+                    <div className="w-16 h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-green-500 rounded-full transition-all"
+                        style={{ width: `${(status.done / status.total) * 100}%` }}
+                      />
+                    </div>
+                  )}
+                  <span className="text-slate-500">{isExpanded ? "▲" : "▼"}</span>
+                </div>
               </button>
 
-              {/* Expanded content */}
+              {/* Contenu déplié */}
               {isExpanded && (
                 <div className="px-4 pb-4">
-                  {/* Phase note */}
                   <p className="text-slate-400 text-xs mb-4 italic border-l-2 border-orange-700 pl-3">
                     {week.notes}
                   </p>
 
-                  {/* 7 days grid */}
+                  {/* Grille 7 jours */}
                   <div className="grid grid-cols-7 gap-1 mb-2">
                     {DAY_NAMES.map((d) => (
-                      <div key={d} className="text-center text-xs text-slate-500 font-medium">
-                        {d}
-                      </div>
+                      <div key={d} className="text-center text-xs text-slate-500 font-medium">{d}</div>
                     ))}
                   </div>
 
                   <div className="grid grid-cols-7 gap-1">
                     {sessionsByDay.map((daySessions, dayIndex) => (
-                      <div key={dayIndex} className="space-y-1 min-h-[60px]">
+                      <div key={dayIndex} className="space-y-1 min-h-[56px]">
                         {daySessions.length === 0 ? (
-                          <div className="h-full min-h-[56px] rounded-xl border border-dashed border-slate-800 opacity-30" />
+                          <div className="h-full min-h-[52px] rounded-xl border border-dashed border-slate-800 opacity-20" />
                         ) : (
                           daySessions.map((session) => (
                             <SessionCard
                               key={session.id}
                               session={session}
-                              onUpdate={(updated) =>
-                                handleSessionUpdate(week.weekNumber, updated)
-                              }
-                              onDelete={(id) =>
-                                handleSessionDelete(week.weekNumber, id)
-                              }
+                              onUpdate={(u) => handleSessionUpdate(week.weekNumber, u)}
+                              onDelete={(id) => handleSessionDelete(week.weekNumber, id)}
                             />
                           ))
                         )}
@@ -230,19 +244,18 @@ export default function PlanPage() {
                     ))}
                   </div>
 
-                  {/* Week totals */}
-                  <div className="mt-4 flex flex-wrap gap-2 text-xs text-slate-500">
-                    <span>
-                      ⏱ Volume total :{" "}
-                      <b className="text-slate-300">
-                        {formatDuration(week.totalDurationMin)}
-                      </b>
-                    </span>
-                    {week.sessions.some((s) => s.distanceKm) && (
+                  {/* Résumé semaine */}
+                  <div className="mt-4 pt-3 border-t border-slate-800 flex flex-wrap gap-3 text-xs text-slate-500">
+                    <span>⏱ Prévu : <b className="text-slate-300">{formatDuration(week.totalDurationMin)}</b></span>
+                    {status.done > 0 && (
                       <span>
-                        📍 Distance longue sortie :{" "}
-                        <b className="text-slate-300">
-                          {Math.max(...week.sessions.map((s) => s.distanceKm ?? 0))} km
+                        ✅ Réalisé :{" "}
+                        <b className="text-green-400">
+                          {formatDuration(
+                            week.sessions
+                              .filter((s) => s.log)
+                              .reduce((acc, s) => acc + (s.log?.durationMin ?? 0), 0)
+                          )}
                         </b>
                       </span>
                     )}
