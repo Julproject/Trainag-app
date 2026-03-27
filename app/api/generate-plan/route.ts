@@ -1,23 +1,24 @@
 // app/api/generate-plan/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { generatePlan } from "@/lib/planGenerator";
-import type { SportType, GoalType } from "@/lib/types";
+import type { SportType, GoalType, PaceReference } from "@/lib/types";
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { sport, goal, eventDate, hoursPerWeek } = body as {
+    const { sport, goal, eventDate, hoursPerWeek, paceRef } = body as {
       sport: SportType;
       goal: GoalType;
       eventDate: string;
       hoursPerWeek: number;
+      paceRef: PaceReference;
     };
 
     if (!sport || !goal || !eventDate || !hoursPerWeek) {
       return NextResponse.json({ error: "Paramètres manquants" }, { status: 400 });
     }
 
-    const plan = generatePlan(sport, goal, eventDate, hoursPerWeek);
+    const plan = generatePlan(sport, goal, eventDate, hoursPerWeek, paceRef ?? {});
     return NextResponse.json(plan);
   } catch (e) {
     console.error(e);
