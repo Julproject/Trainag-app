@@ -14,23 +14,43 @@ export type SessionType =
   | "natation"
   | "velo";
 
+// ── Référence de performance saisie par l'utilisateur ─────────────────────────
+
+export interface PaceReference {
+  // Course à pied : allure en secondes/km (ex: 5'30" = 330)
+  runPaceSecPerKm?: number;
+  // Natation : temps au 100m en secondes (ex: 1'45" = 105)
+  swimPaceSec100m?: number;
+  // Vélo : vitesse moyenne en km/h (ex: 30)
+  bikeSpeedKmh?: number;
+  // Vélo : FTP en watts (optionnel)
+  bikeFTPWatts?: number;
+}
+
+// ── Allures cibles calculées pour une séance ──────────────────────────────────
+
+export interface TargetPaces {
+  lines: string[]; // ex: ["Allure : 5'45\"/km", "FC cible : Z2 (130–145 bpm)"]
+}
+
 export interface SessionLog {
-  durationMin: number;  // temps réel saisi par l'utilisateur
-  distanceKm?: number;  // distance réelle (optionnelle)
-  note?: string;        // commentaire libre
-  loggedAt: string;     // ISO date
+  durationMin: number;
+  distanceKm?: number;
+  note?: string;
+  loggedAt: string;
 }
 
 export interface Session {
   id: string;
-  day: number; // 0=Lundi, 6=Dimanche
+  day: number; // 0=Lun … 6=Dim
   type: SessionType;
   label: string;
   durationMin: number;
   description: string;
   distanceKm?: number;
   intensity: "repos" | "faible" | "modere" | "eleve";
-  log?: SessionLog; // ce que l'athlète a réellement fait
+  targetPaces?: TargetPaces;
+  log?: SessionLog;
 }
 
 export interface Week {
@@ -50,6 +70,7 @@ export interface TrainingPlan {
   hoursPerWeek: number;
   totalWeeks: number;
   weeks: Week[];
+  paceRef: PaceReference;
   createdAt: string;
 }
 
@@ -68,4 +89,5 @@ export interface SetupFormData {
   eventDate: string;
   hoursPerWeek: number;
   goal: GoalType;
+  paceRef: PaceReference;
 }
