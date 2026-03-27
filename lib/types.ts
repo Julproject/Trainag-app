@@ -53,6 +53,16 @@ export interface TrainingPlan {
   createdAt: string;
 }
 
+export interface StravaActivity {
+  id: number;
+  name: string;
+  type: string;
+  start_date: string;
+  elapsed_time: number;
+  distance: number;
+  moving_time: number;
+}
+
 export interface SetupFormData {
   sport: SportType;
   eventDate: string;
