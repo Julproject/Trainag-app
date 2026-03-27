@@ -1,244 +1,505 @@
 // lib/planGenerator.ts
 import { v4 as uuidv4 } from "uuid";
-import { computeTargetPaces } from "./paceCalculator";
+import {
+  getRunPaces, getSwimPaces, getBikePaces,
+  deriveZones, fmtPace, fmtSwim, fmtSpeed,
+} from "./paceCalculator";
 import type {
-  TrainingPlan, SportType, GoalType, Week, Session, SessionType, PaceReference,
+  TrainingPlan, Week, Session, SessionDetail,
+  SportType, GoalType, PaceZones, PlannedRace,
+  MicrocycleType, DisciplineType, TriDistance,
 } from "./types";
 
-const PLAN_DURATIONS: Record<SportType, number> = {
-  marathon: 16,
-  "semi-marathon": 10,
-  triathlon: 16,
-  velo: 12,
-};
+// ── Utilitaires ────────────────────────────────────────────────────────────────
 
-function addWeeks(dateStr: string, weeks: number): string {
-  const d = new Date(dateStr);
-  d.setDate(d.getDate() + weeks * 7);
+function addDays(date: string, days: number): string {
+  const d = new Date(date);
+  d.setDate(d.getDate() + days);
   return d.toISOString().split("T")[0];
 }
 
-function getPlanStartDate(eventDate: string, totalWeeks: number): string {
-  const event = new Date(eventDate);
-  event.setDate(event.getDate() - totalWeeks * 7);
-  return event.toISOString().split("T")[0];
+function addWeeks(date: string, weeks: number): string {
+  return addDays(date, weeks * 7);
 }
 
-function makeSession(
-  sport: SportType,
-  paceRef: PaceReference,
+function getPlanStart(eventDate: string, totalWeeks: number): string {
+  return addDays(eventDate, -(totalWeeks * 7));
+}
+
+function mkId() { return uuidv4(); }
+
+// ── Construction d'une séance ──────────────────────────────────────────────────
+
+function mkSession(
   day: number,
-  type: SessionType,
+  discipline: DisciplineType,
   label: string,
   durationMin: number,
-  description: string,
+  detail: SessionDetail,
   options: Partial<Session> = {}
 ): Session {
-  const intensityMap: Record<SessionType, Session["intensity"]> = {
-    repos: "repos", "recup-active": "faible", endurance: "modere",
-    natation: "modere", velo: "modere", muscu: "faible",
-    seuil: "eleve", fractionne: "eleve", "longue-sortie": "modere", brique: "eleve",
+  const intensityMap: Record<string, Session["intensity"]> = {
+    repos: "repos",
+    ppg: "faible",
+  };
+  const defaultIntensity: Record<DisciplineType, Session["intensity"]> = {
+    repos: "repos",
+    nat: "modere",
+    velo: "modere",
+    cap: "modere",
+    ppg: "faible",
+    brique: "eleve",
   };
 
-  const targetPaces = type !== "repos" && type !== "muscu"
-    ? computeTargetPaces(sport, type, paceRef)
-    : undefined;
-
   return {
-    id: uuidv4(),
-    day, type, label, durationMin, description,
-    intensity: intensityMap[type] || "modere",
-    targetPaces,
+    id: mkId(),
+    day,
+    discipline,
+    label,
+    durationMin: Math.max(0, durationMin),
+    detail,
+    intensity: intensityMap[discipline] ?? defaultIntensity[discipline] ?? "modere",
     ...options,
   };
 }
 
-function getWeekLoadFactor(weekNum: number, totalWeeks: number): number {
-  if (weekNum % 4 === 0) return 0.65;
-  const progress = weekNum / totalWeeks;
-  if (progress < 0.3) return 0.7 + progress * 0.5;
-  if (progress < 0.7) return 0.85 + Math.sin(progress * Math.PI) * 0.15;
-  if (progress < 0.9) return 0.75 - (progress - 0.7) * 1.5;
-  return 0.5;
-}
+// ── Structure hebdomadaire fixe (calquée sur le plan PDF) ─────────────────────
+//
+// Lun → Repos
+// Mar → Vélo (HT ou route)
+// Mer → CP Fartlek (+Nat si 2 séances nat/sem)
+// Jeu → CP Foncier/Tempo + PPG
+// Ven → CP Fractionné
+// Sam → Vélo longue sortie
+// Dim → Natation
 
-function getPhase(weekNum: number, totalWeeks: number): Week["phase"] {
-  const p = weekNum / totalWeeks;
-  if (p < 0.25) return "base";
-  if (p < 0.55) return "construction";
-  if (p < 0.8) return "specifique";
-  if (weekNum < totalWeeks) return "affutage";
-  return "course";
-}
+function buildTriWeek(
+  weekNum: number,
+  totalWeeks: number,
+  microcycle: MicrocycleType,
+  zones: PaceZones,
+  natKm: number,
+  veloKm: number,
+  capKm: number,
+  veloH: number,
+  race?: PlannedRace
+): Session[] {
+  const sessions: Session[] = [];
 
-// ── Builders par sport ────────────────────────────────────────────────────────
+  const z0 = zones.z0_runPace ?? 390;
+  const x = zones.x_runPace ?? 320;
+  const m = zones.m_runPace ?? 270;
+  const l = zones.l_runPace ?? 280;
+  const xx = zones.xx_runPace ?? 255;
+  const swim = zones.swimPace100m ?? 105;
+  const spd = zones.bikeSpeedKmh ?? 30;
+  const twoNatSessions = natKm >= 3.5;
 
-function buildMarathonWeek(sport: SportType, paceRef: PaceReference, weekNum: number, totalWeeks: number, hoursPerWeek: number): Session[] {
-  const factor = getWeekLoadFactor(weekNum, totalWeeks);
-  const scale = (hoursPerWeek * 60 * factor) / 360;
-  const phase = getPhase(weekNum, totalWeeks);
-  const mk = (day: number, type: SessionType, label: string, dur: number, desc: string, opts: Partial<Session> = {}) =>
-    makeSession(sport, paceRef, day, type, label, Math.max(20, Math.round(dur * scale)), desc, opts);
+  // ── LUNDI : Repos ──────────────────────────────────────────────────────────
+  sessions.push(mkSession(0, "repos", "Repos & Récupération", 0, {
+    mainSet: "Récupération totale — mobilité, étirements, sommeil",
+    paces: [],
+  }));
 
-  if (phase === "affutage" || phase === "course") return [
-    mk(0, "endurance", "Footing récup", 40, "Allure très confortable Z2"),
-    mk(2, "seuil", "Seuil court", 45, "15' échauffement + 2×10' allure semi + 10' calme"),
-    mk(4, "longue-sortie", "Sortie longue courte", 70, "Allure marathon, confiance", { distanceKm: Math.round(12 * scale) }),
-    makeSession(sport, paceRef, 6, "repos", "Repos", 0, "Repos complet"),
-  ];
+  // ── MARDI : Vélo HT ───────────────────────────────────────────────────────
+  const veloMarDur = Math.round(veloH * 60 * 0.50);
+  const veloMarKm = Math.round(veloKm * 0.50);
 
-  if (phase === "base") return [
-    mk(0, "endurance", "Footing endurance", 50, "Allure conversationnelle Z2"),
-    mk(2, "endurance", "Footing tempo", 45, "Légèrement plus soutenu que Z2"),
-    mk(4, "longue-sortie", "Sortie longue", 80, "Allure confortable, sans forcer", { distanceKm: Math.round(14 * scale) }),
-    makeSession(sport, paceRef, 5, "recup-active", "Repos actif", 30, "Marche ou mobilité légère"),
-    makeSession(sport, paceRef, 6, "repos", "Repos complet", 0, "Repos passif total"),
-  ];
-
-  return [
-    mk(0, "endurance", "Footing récup", 45, "Z2 stricte"),
-    mk(1, "fractionne", "Fractionné court", 55, "6–8×400m allure 5km avec 90s récup"),
-    mk(3, "seuil", "Allure seuil", 55, "20–30' au seuil lactique"),
-    mk(5, "longue-sortie", "Sortie longue", 90, "Allure marathon cible sur la fin", { distanceKm: Math.round(22 * scale) }),
-    makeSession(sport, paceRef, 6, "repos", "Repos", 0, "Récupération passive"),
-  ];
-}
-
-function buildSemiMarathonWeek(sport: SportType, paceRef: PaceReference, weekNum: number, totalWeeks: number, hoursPerWeek: number): Session[] {
-  const factor = getWeekLoadFactor(weekNum, totalWeeks);
-  const scale = (hoursPerWeek * 60 * factor) / 300;
-  const phase = getPhase(weekNum, totalWeeks);
-  const mk = (day: number, type: SessionType, label: string, dur: number, desc: string, opts: Partial<Session> = {}) =>
-    makeSession(sport, paceRef, day, type, label, Math.max(20, Math.round(dur * scale)), desc, opts);
-
-  if (phase === "affutage" || phase === "course") return [
-    mk(0, "endurance", "Footing récup", 35, "Très léger"),
-    mk(2, "seuil", "Allure semi", 40, "10' au seuil, bonne maîtrise"),
-    mk(4, "longue-sortie", "Dernière longue", 60, "Relaxe, confiance", { distanceKm: Math.round(10 * scale) }),
-  ];
-
-  if (phase === "base") return [
-    mk(0, "endurance", "Footing Z2", 40, "Endurance fondamentale"),
-    mk(2, "endurance", "Footing varié", 40, "Quelques accélérations légères"),
-    mk(5, "longue-sortie", "Sortie longue", 65, "Allure facile", { distanceKm: Math.round(11 * scale) }),
-    makeSession(sport, paceRef, 6, "repos", "Repos", 0, "Repos passif"),
-  ];
-
-  return [
-    mk(0, "endurance", "Footing récup", 35, "Z2 récupération"),
-    mk(1, "fractionne", "Fractionné", 50, "5×1km à allure 10km avec 2' récup"),
-    mk(3, "seuil", "Seuil progressif", 50, "25' au seuil lactique"),
-    mk(5, "longue-sortie", "Sortie longue", 70, "Allure semi cible sur 5 derniers km", { distanceKm: Math.round(15 * scale) }),
-    makeSession(sport, paceRef, 6, "repos", "Repos", 0, "Récupération passive"),
-  ];
-}
-
-function buildTriathlonWeek(sport: SportType, paceRef: PaceReference, weekNum: number, totalWeeks: number, hoursPerWeek: number): Session[] {
-  const factor = getWeekLoadFactor(weekNum, totalWeeks);
-  const scale = (hoursPerWeek * 60 * factor) / 420;
-  const phase = getPhase(weekNum, totalWeeks);
-  const mk = (day: number, type: SessionType, label: string, dur: number, desc: string, opts: Partial<Session> = {}) =>
-    makeSession(sport, paceRef, day, type, label, Math.max(20, Math.round(dur * scale)), desc, opts);
-
-  if (phase === "affutage" || phase === "course") return [
-    mk(0, "natation", "Natation légère", 40, "Technique, sans effort"),
-    mk(2, "velo", "Vélo récup", 50, "Z2, petite vitesse"),
-    mk(4, "endurance", "Footing court", 30, "20–25' allure facile"),
-    makeSession(sport, paceRef, 5, "repos", "Repos complet", 0, "Récupération avant course"),
-  ];
-
-  if (phase === "base") return [
-    mk(0, "natation", "Natation endurance", 50, "Technique + endurance, 1500–2000m"),
-    mk(1, "velo", "Vélo Z2", 80, "Sortie longue vélo confortable"),
-    mk(3, "endurance", "Footing Z2", 40, "Endurance fondamentale"),
-    mk(5, "natation", "Natation technique", 45, "Focus technique de nage"),
-    makeSession(sport, paceRef, 6, "repos", "Repos", 0, "Repos passif"),
-  ];
-
-  return [
-    mk(0, "natation", "Natation seuil", 50, "8×100m allure rapide + 200m récup"),
-    mk(1, "velo", "Vélo long", 90, "Z2–Z3, incluant côtes"),
-    mk(2, "brique", "Séance brique vélo→cap", 60, "45' vélo + 15' course directement après"),
-    mk(4, "endurance", "Footing seuil", 45, "20' seuil lactique"),
-    mk(5, "natation", "Natation longue", 55, "Open water simulation si possible"),
-    makeSession(sport, paceRef, 6, "repos", "Repos", 0, "Récupération passive"),
-  ];
-}
-
-function buildVeloWeek(sport: SportType, paceRef: PaceReference, weekNum: number, totalWeeks: number, hoursPerWeek: number): Session[] {
-  const factor = getWeekLoadFactor(weekNum, totalWeeks);
-  const scale = (hoursPerWeek * 60 * factor) / 360;
-  const phase = getPhase(weekNum, totalWeeks);
-  const mk = (day: number, type: SessionType, label: string, dur: number, desc: string, opts: Partial<Session> = {}) =>
-    makeSession(sport, paceRef, day, type, label, Math.max(20, Math.round(dur * scale)), desc, opts);
-
-  if (phase === "affutage" || phase === "course") return [
-    mk(0, "velo", "Vélo récup", 45, "Petits braquets, jambes tournantes"),
-    mk(2, "seuil", "Seuil court vélo", 55, "2×10' au seuil + ouverture de vitesse"),
-    mk(4, "velo", "Sortie légère", 60, "Allure facile, confiance"),
-    makeSession(sport, paceRef, 6, "repos", "Repos", 0, "Avant la course"),
-  ];
-
-  if (phase === "base") return [
-    mk(0, "velo", "Endurance vélo", 70, "Z2, cadence 80–90 rpm"),
-    makeSession(sport, paceRef, 2, "muscu", "Muscu jambes", 45, "Squat, fentes, gainage"),
-    mk(4, "velo", "Endurance + accélérations", 65, "Z2 + 4×1' Z4"),
-    mk(6, "longue-sortie", "Sortie longue", 90, "Z2, progressive", { distanceKm: Math.round(60 * scale) }),
-  ];
-
-  return [
-    mk(0, "recup-active", "Récupération active", 45, "Jambes légères"),
-    mk(1, "fractionne", "Fractionné vélo", 65, "6×3' Z5 avec 3' récup"),
-    mk(3, "seuil", "Seuil long", 70, "2×20' à allure seuil lactique"),
-    mk(5, "longue-sortie", "Sortie longue", 110, "Z2–Z3, terrain varié", { distanceKm: Math.round(80 * scale) }),
-    makeSession(sport, paceRef, 6, "repos", "Repos", 0, "Récupération passive"),
-  ];
-}
-
-function buildWeekSessions(sport: SportType, paceRef: PaceReference, weekNum: number, totalWeeks: number, hoursPerWeek: number): Session[] {
-  switch (sport) {
-    case "marathon": return buildMarathonWeek(sport, paceRef, weekNum, totalWeeks, hoursPerWeek);
-    case "semi-marathon": return buildSemiMarathonWeek(sport, paceRef, weekNum, totalWeeks, hoursPerWeek);
-    case "triathlon": return buildTriathlonWeek(sport, paceRef, weekNum, totalWeeks, hoursPerWeek);
-    case "velo": return buildVeloWeek(sport, paceRef, weekNum, totalWeeks, hoursPerWeek);
+  if (microcycle === "competition") {
+    sessions.push(mkSession(1, "velo", "Vélo activation pré-race", Math.min(30, veloMarDur), {
+      mainSet: "Activation légère, séries courtes à allure vive",
+      paces: getBikePaces(zones, "affutage"),
+    }, { distanceKm: Math.min(20, veloMarKm) }));
+  } else if (microcycle === "recup-active") {
+    sessions.push(mkSession(1, "velo", "Vélo récupération (HT)", veloMarDur, {
+      warmup: "10' très facile",
+      mainSet: "HT vélocité — cadence élevée, résistance minimale. Una pierna possible.",
+      paces: getBikePaces(zones, "recup-active"),
+    }, { distanceKm: veloMarKm }));
+  } else if (microcycle === "intensif-XX") {
+    sessions.push(mkSession(1, "velo", "Vélo HT séries XX", veloMarDur, {
+      warmup: "15' Z1",
+      mainSet: `Séries XX : 6–8×3' à pleine intensité. Récup 3' entre. ~${veloMarKm}km total`,
+      cooldown: "10' Z1",
+      paces: getBikePaces(zones, "intensif-XX", "ht"),
+    }, { distanceKm: veloMarKm }));
+  } else {
+    sessions.push(mkSession(1, "velo", "Vélo HT (una pierna + vélocité)", veloMarDur, {
+      warmup: "10' Z1",
+      mainSet: `HT una pierna : 6×3' par jambe. Puis séries ${microcycle === "rythme-X" ? "X" : "Z2"}. ~${veloMarKm}km`,
+      cooldown: "5' récup",
+      paces: getBikePaces(zones, microcycle, "ht"),
+    }, { distanceKm: veloMarKm }));
   }
+
+  // ── MERCREDI : CP Fartlek (+Nat si 2 séances) ────────────────────────────
+  const capMerKm = Math.round(capKm * 0.18);
+  const capMerDur = Math.round(capMerKm * (microcycle === "recup-active" ? z0 : x) / 60 + 20);
+
+  if (twoNatSessions) {
+    // Nat le matin (60% du volume nat)
+    const natMerM = Math.round(natKm * 1000 * 0.60);
+    const natMerDur = Math.round(natMerM / 1000 * (swim + 30));
+    sessions.push(mkSession(2, "nat", "Natation endurance (matin)", natMerDur, {
+      warmup: "400m échauffement",
+      mainSet: `${natMerM - 600}m endurance + 200m cool-down. Total ~${natMerM}m`,
+      paces: getSwimPaces(zones, "foncier"),
+    }, { distanceM: natMerM }));
+  }
+
+  sessions.push(mkSession(2, "cap", "CAP Fartlek", capMerDur, {
+    warmup: "15' Z0",
+    mainSet: microcycle === "recup-active"
+      ? `${capMerKm}km foncier Z0 — allure conversationnelle uniquement`
+      : microcycle === "intensif-XX"
+      ? `Fartlek XX : 6×(2' à ${fmtPace(xx)} + 2' récup à ${fmtPace(z0)}). Total ~${capMerKm}km`
+      : `Fartlek X : ex 5×(3' à ${fmtPace(x)} + 2' récup à ${fmtPace(z0 + 20)}). Total ~${capMerKm}km`,
+    cooldown: "10' Z0",
+    paces: getRunPaces(zones, microcycle, "fartlek"),
+  }, { distanceKm: capMerKm }));
+
+  // ── JEUDI : CP Foncier/Tempo + PPG ───────────────────────────────────────
+  const capJeuKm = Math.round(capKm * (twoNatSessions ? 0.38 : 0.40));
+  const capJeuDur = Math.round(capJeuKm * (microcycle === "recup-active" ? z0 + 10 : z0) / 60 + 10);
+  const ppgDur = microcycle === "recup-active" ? 20 : 30;
+
+  sessions.push(mkSession(3, "cap", "CAP Foncier/Tempo + PPG", capJeuDur + ppgDur, {
+    warmup: "15' Z0",
+    mainSet: microcycle === "foncier"
+      ? `${capJeuKm}km foncier Z0 (${fmtPace(z0)}). Long run à allure confortable.`
+      : microcycle === "intensif-XX"
+      ? `Tempo XX : 3×10' à ${fmtPace(xx)} avec 3' récup Z0. Total ~${capJeuKm}km`
+      : microcycle === "rythme-X"
+      ? `Tempo X : 2–3×10' à ${fmtPace(x)} avec 3' récup. Total ~${capJeuKm}km`
+      : `${capJeuKm}km Z0 — allure confortable ${fmtPace(z0)}`,
+    cooldown: `${ppgDur}' PPG : gainage, squats, fentes, mollets, proprioception`,
+    paces: getRunPaces(zones, microcycle),
+  }, { distanceKm: capJeuKm }));
+
+  // ── VENDREDI : CP Fractionné ──────────────────────────────────────────────
+  const capVenKm = Math.round(capKm * 0.40);
+  const targetPace = microcycle === "intensif-XX" ? xx : m;
+  const capVenDur = Math.round(capVenKm * (targetPace + 40) / 60 + 20);
+
+  if (microcycle === "competition") {
+    sessions.push(mkSession(4, "repos", "Repos pré-race", 0, {
+      mainSet: "Repos complet ou marche légère 20'. Préparer matériel.",
+      paces: [],
+    }));
+  } else if (microcycle === "recup-active") {
+    sessions.push(mkSession(4, "cap", "CAP récupération légère", Math.round(capVenKm * z0 / 60), {
+      mainSet: `${capVenKm}km très léger Z0 — ne pas forcer`,
+      paces: [{ label: "Allure Z0", value: fmtPace(z0 + 15), zone: "Z0" }],
+    }, { distanceKm: capVenKm }));
+  } else {
+    const seances = microcycle === "intensif-XX"
+      ? `6–8×400m à ${fmtPace(xx)} (allure XX) avec 200m récup à ${fmtPace(z0 + 30)}`
+      : `8–10×400m à ${fmtPace(m)} (allure M-race) avec 200m récup à ${fmtPace(z0 + 30)}`;
+    sessions.push(mkSession(4, "cap", "CAP Fractionné ⚡", capVenDur, {
+      warmup: `20' échauffement progressif jusqu'à ${fmtPace(z0)}`,
+      mainSet: `${seances}\n→ Total ~${capVenKm}km`,
+      cooldown: `15' retour au calme Z0`,
+      paces: getRunPaces(zones, microcycle, "fractionne-M"),
+    }, { distanceKm: capVenKm }));
+  }
+
+  // ── SAMEDI : Vélo longue sortie ────────────────────────────────────────────
+  const veloSamDur = Math.round(veloH * 60 * 0.50);
+  const veloSamKm = Math.round(veloKm * 0.50);
+
+  if (microcycle === "competition") {
+    sessions.push(mkSession(5, "velo", "Activation vélo", 20, {
+      mainSet: "Activation courte 20–30' + 3 accélérations 10\" pour ouvrir les jambes",
+      paces: [{ label: "Légère activation", value: fmtSpeed(spd * 0.70), zone: "Z1" }],
+    }));
+  } else {
+    sessions.push(mkSession(5, "velo", "Vélo longue sortie", veloSamDur, {
+      warmup: "15' Z1",
+      mainSet: microcycle === "foncier" || microcycle === "recup-active"
+        ? `Sortie longue Z2 — ${veloSamKm}km à allure confortable ${fmtSpeed(spd * 0.82)}. Nutrition : 1 gel/45min au-delà de 2h`
+        : `Sortie longue Z2–Z3 — ${veloSamKm}km. Inclure ${microcycle === "intensif-XX" ? "3×20' Z4" : "2–3 côtes X"}`,
+      cooldown: "10' Z1",
+      paces: getBikePaces(zones, microcycle === "recup-active" ? "recup-active" : "foncier"),
+    }, { distanceKm: veloSamKm }));
+  }
+
+  // ── DIMANCHE : Natation ────────────────────────────────────────────────────
+  const natDimRatio = twoNatSessions ? 0.40 : 1.0;
+  const natDimM = Math.round(natKm * 1000 * natDimRatio);
+  const natDimDur = Math.round(natDimM / 1000 * (swim + 20));
+
+  if (microcycle === "competition" && race) {
+    sessions.push(mkSession(6, "nat", `🏁 RACE — ${race.name}`, 0, {
+      mainSet: `COMPÉTITION ${race.distance} · Allure cible : ${
+        race.distance === "L" ? fmtPace(l) : fmtPace(m)
+      } sur le CAP`,
+      paces: getRunPaces(zones, "competition"),
+    }, { intensity: "race" }));
+  } else {
+    sessions.push(mkSession(6, "nat", "Natation", natDimDur, {
+      warmup: "400m échauffement technique",
+      mainSet: microcycle === "recup-active"
+        ? `${natDimM}m technique pure — drill, respiration, virages. Pas d'effort.`
+        : microcycle === "intensif-XX"
+        ? `${natDimM}m : 10×100m à ${fmtSwim(swim - 8)} avec 20\" récup + 400m cool-down`
+        : `${natDimM}m endurance : 4×${Math.round(natDimM / 4 / 100) * 100}m avec 30\" récup`,
+      cooldown: "200m récup",
+      paces: getSwimPaces(zones, microcycle),
+    }, { distanceM: natDimM }));
+  }
+
+  return sessions;
 }
+
+// ── Structure des phases (calquée sur le PDF) ─────────────────────────────────
+// 26 semaines → adaptées à n'importe quelle durée
+
+interface WeekTemplate {
+  microcycle: MicrocycleType;
+  phase: string;
+  focusNote: string;
+  natFactor: number;   // multiplicateur sur le volume de base
+  veloFactor: number;
+  capFactor: number;
+}
+
+function buildWeekTemplates(totalWeeks: number): WeekTemplate[] {
+  // On crée le plan en % de durée, adapté au nombre de semaines
+  const pct = (p: number) => Math.round(p * totalWeeks);
+
+  const templates: WeekTemplate[] = [];
+
+  for (let w = 1; w <= totalWeeks; w++) {
+    const progress = w / totalWeeks;
+
+    // Semaines de compétition toutes les ~4–5 semaines (simplifiées)
+    const isCompWeek = [
+      pct(0.12), pct(0.23), pct(0.31), pct(0.46),
+      pct(0.65), pct(0.81), pct(0.96), totalWeeks
+    ].includes(w);
+
+    // Semaines de récup actif après chaque compét
+    const isRecupWeek = [
+      pct(0.04), pct(0.15), pct(0.27), pct(0.35),
+      pct(0.50), pct(0.69), pct(0.85)
+    ].some(wk => Math.abs(w - wk) <= 1 && w > wk);
+
+    if (isCompWeek) {
+      templates.push({
+        microcycle: "competition",
+        phase: getPhase(progress),
+        focusNote: "Semaine de compétition. Affûtage, repos pré-race, activation.",
+        natFactor: 0.35, veloFactor: 0.20, capFactor: 0.25,
+      });
+    } else if (isRecupWeek) {
+      templates.push({
+        microcycle: "recup-active",
+        phase: getPhase(progress),
+        focusNote: "Récupération active post-compét. Tout dans Z0. Retour progressif.",
+        natFactor: 0.70, veloFactor: 0.65, capFactor: 0.65,
+      });
+    } else if (progress < 0.20) {
+      // Affûtage pré-saison
+      templates.push({
+        microcycle: progress < 0.10 ? "affutage" : "rythme-X",
+        phase: "Pré-saison",
+        focusNote: "Mise en route. Séances vives X. Relance progressive.",
+        natFactor: 0.75, veloFactor: 0.80, capFactor: 0.75,
+      });
+    } else if (progress < 0.50) {
+      // Blocs de construction
+      const isFoncier = w % 3 === 0;
+      templates.push({
+        microcycle: isFoncier ? "foncier" : "rythme-X",
+        phase: "Construction",
+        focusNote: isFoncier
+          ? "Foncier/endurance. Volume dans Z0. HT vélocité."
+          : "Rythme X. Fartlek mer + fractionné M-race vendredi.",
+        natFactor: 0.90 + (progress * 0.2),
+        veloFactor: 0.88 + (progress * 0.2),
+        capFactor: 0.85 + (progress * 0.2),
+      });
+    } else if (progress < 0.75) {
+      // Blocs été / volume max
+      const isXX = w % 4 === 2;
+      templates.push({
+        microcycle: isXX ? "intensif-XX" : "foncier",
+        phase: "Volume / Intensité",
+        focusNote: isXX
+          ? "Intensif XX. HT séries XX. Fractionné 4'15/km."
+          : "Volume maximal. Long vélo + long run. Foncier Z0.",
+        natFactor: 1.0 + (progress - 0.5) * 0.3,
+        veloFactor: 1.0 + (progress - 0.5) * 0.3,
+        capFactor: 1.0 + (progress - 0.5) * 0.3,
+      });
+    } else {
+      // Prépa finale
+      templates.push({
+        microcycle: progress > 0.92 ? "affutage" : "rythme-X",
+        phase: "Prépa finale",
+        focusNote: progress > 0.92
+          ? "Affûtage final. Volume ↓↓. Intensité maintenue. Confiance."
+          : "Rythme qualité. Séances spécifiques race. Long vélo 3h30.",
+        natFactor: progress > 0.92 ? 0.60 : 0.95,
+        veloFactor: progress > 0.92 ? 0.55 : 0.95,
+        capFactor: progress > 0.92 ? 0.55 : 0.90,
+      });
+    }
+  }
+
+  return templates;
+}
+
+function getPhase(progress: number): string {
+  if (progress < 0.15) return "Pré-saison";
+  if (progress < 0.45) return "Construction";
+  if (progress < 0.70) return "Volume / Intensité";
+  if (progress < 0.90) return "Prépa spécifique";
+  return "Affûtage final";
+}
+
+// ── Volumes de base selon heures/semaine ──────────────────────────────────────
+
+function getBaseVolumes(hoursPerWeek: number, mainDistance: TriDistance) {
+  // Référence : 8h/semaine pour distance L
+  // Proportionnel au temps dispo et à la distance cible
+  const distFactor = mainDistance === "L" ? 1.0 : mainDistance === "M" ? 0.75 : 0.50;
+  const hourFactor = hoursPerWeek / 8;
+  const f = distFactor * hourFactor;
+
+  return {
+    natKm: 3.5 * f,    // km natation
+    veloKm: 90 * f,    // km vélo
+    capKm: 28 * f,     // km course à pied
+    veloH: 3.5 * f,    // heures vélo
+  };
+}
+
+// ── Génération du plan ────────────────────────────────────────────────────────
 
 export function generatePlan(
   sport: SportType,
   goal: GoalType,
   eventDate: string,
   hoursPerWeek: number,
-  paceRef: PaceReference
+  paceZones: PaceZones,
+  races: PlannedRace[],
+  totalWeeks: number = 20
 ): TrainingPlan {
-  const totalWeeks = PLAN_DURATIONS[sport];
-  const startDate = getPlanStartDate(eventDate, totalWeeks);
-  const adjustedHours = goal === "debuter" ? Math.min(hoursPerWeek, 5) : hoursPerWeek;
+  // Compléter les zones manquantes
+  const fullZones: PaceZones = { ...paceZones };
+  if (paceZones.m_runPace && !paceZones.z0_runPace) {
+    Object.assign(fullZones, deriveZones(paceZones.m_runPace));
+  }
 
-  const phaseNotes: Record<Week["phase"], string> = {
-    base: "Phase de base : construire l'aérobie, habituer le corps à l'effort régulier.",
-    construction: "Phase de construction : augmenter l'intensité et la spécificité.",
-    specifique: "Phase spécifique : séances proches des conditions de course.",
-    affutage: "Affûtage : réduire le volume, garder l'intensité. Le corps récupère et absorbe.",
-    course: "Semaine de course ! Restez léger, dormez bien, faites confiance à votre préparation.",
-  };
+  const startDate = getPlanStart(eventDate, totalWeeks);
+  const mainRace = races.find(r => r.priority === "A");
+  const mainDistance: TriDistance = mainRace?.distance ?? "L";
+  const base = getBaseVolumes(hoursPerWeek, mainDistance);
+  const templates = buildWeekTemplates(totalWeeks);
 
-  const weeks: Week[] = Array.from({ length: totalWeeks }, (_, i) => {
+  const weeks: Week[] = templates.map((tpl, i) => {
     const w = i + 1;
-    const sessions = buildWeekSessions(sport, paceRef, w, totalWeeks, adjustedHours);
+    const weekStart = addWeeks(startDate, i);
+    const weekEnd = addDays(weekStart, 6);
+
+    // Volumes de la semaine
+    const natKm = Math.round(base.natKm * tpl.natFactor * 10) / 10;
+    const veloKm = Math.round(base.veloKm * tpl.veloFactor);
+    const capKm = Math.round(base.capKm * tpl.capFactor);
+    const veloH = Math.round(base.veloH * tpl.veloFactor * 10) / 10;
+
+    // Compétition cette semaine ?
+    const race = races.find(r => {
+      const rd = new Date(r.date);
+      const ws = new Date(weekStart);
+      const we = new Date(weekEnd);
+      return rd >= ws && rd <= we;
+    }) ?? (tpl.microcycle === "competition" ? mainRace : undefined);
+
+    const sessions = sport === "triathlon"
+      ? buildTriWeek(w, totalWeeks, tpl.microcycle, fullZones, natKm, veloKm, capKm, veloH, race)
+      : buildRunWeek(w, totalWeeks, tpl.microcycle, fullZones, capKm, race);
+
+    const totalH = Math.round(
+      (sessions.reduce((acc, s) => acc + s.durationMin, 0) / 60) * 10
+    ) / 10;
+
     return {
       weekNumber: w,
-      startDate: addWeeks(startDate, i),
-      phase: getPhase(w, totalWeeks),
+      startDate: weekStart,
+      endDate: weekEnd,
+      microcycle: tpl.microcycle,
+      phase: tpl.phase,
+      focusNote: race ? `🏁 ${race.name} (${race.distance}) — ${tpl.focusNote}` : tpl.focusNote,
       sessions,
-      totalDurationMin: sessions.reduce((acc, s) => acc + s.durationMin, 0),
-      notes: phaseNotes[getPhase(w, totalWeeks)],
+      natKm, veloKm, capKm, veloH, totalH,
+      race,
     };
   });
 
   return {
-    id: uuidv4(),
-    sport, goal, eventDate, hoursPerWeek, totalWeeks, weeks, paceRef,
+    id: mkId(),
+    sport, goal, eventDate, totalWeeks, hoursPerWeek,
+    paceZones: fullZones,
+    races,
+    weeks,
     createdAt: new Date().toISOString(),
   };
+}
+
+// ── Plan course à pied (marathon / semi) ─────────────────────────────────────
+
+function buildRunWeek(
+  weekNum: number,
+  totalWeeks: number,
+  microcycle: MicrocycleType,
+  zones: PaceZones,
+  capKm: number,
+  race?: PlannedRace
+): Session[] {
+  const sessions: Session[] = [];
+  const z0 = zones.z0_runPace ?? 390;
+  const m = zones.m_runPace ?? 270;
+  const xx = zones.xx_runPace ?? 255;
+  const x = zones.x_runPace ?? 320;
+
+  sessions.push(mkSession(0, "repos", "Repos & Récupération", 0, {
+    mainSet: "Repos complet — mobilité, étirements",
+    paces: [],
+  }));
+
+  if (microcycle === "competition") {
+    sessions.push(mkSession(2, "cap", "Activation pré-race", 30, {
+      mainSet: "30' activation légère + 4×100m progressifs",
+      paces: [{ label: "Activation", value: fmtPace(z0 + 20), zone: "Z1" }],
+    }));
+    sessions.push(mkSession(6, "cap", "🏁 RACE", 0, {
+      mainSet: `COMPÉTITION — allure cible ${fmtPace(m)}`,
+      paces: getRunPaces(zones, "competition"),
+    }, { intensity: "race" }));
+    return sessions;
+  }
+
+  const s = (day: number, label: string, km: number, mainSet: string, subType?: string) =>
+    mkSession(day, "cap", label, Math.round(km * (z0 + 20) / 60 + 10), {
+      warmup: "15' Z0",
+      mainSet,
+      cooldown: "10' Z0",
+      paces: getRunPaces(zones, microcycle, subType),
+    }, { distanceKm: km });
+
+  sessions.push(s(1, "Footing récup", capKm * 0.15, `${Math.round(capKm * 0.15)}km Z0 léger — ${fmtPace(z0 + 15)}`));
+  sessions.push(s(2, "CAP Fartlek", capKm * 0.18, microcycle === "intensif-XX"
+    ? `Fartlek XX : 8×(2' à ${fmtPace(xx)} + 2' Z0)` : `Fartlek X : 6×(3' à ${fmtPace(x)} + 2' Z0)`, "fartlek"));
+  sessions.push(mkSession(3, "ppg", "CAP Tempo + PPG", Math.round(capKm * 0.20 * z0 / 60 + 30), {
+    mainSet: `${Math.round(capKm * 0.20)}km tempo ${fmtPace(x)} + 30' PPG (gainage, fentes, squats)`,
+    paces: getRunPaces(zones, microcycle),
+  }, { distanceKm: Math.round(capKm * 0.20) }));
+  sessions.push(s(4, "CAP Fractionné ⚡", capKm * 0.22,
+    `8–10×400m à ${fmtPace(microcycle === "intensif-XX" ? xx : m)} avec 200m récup`, "fractionne-M"));
+  sessions.push(s(6, "Longue sortie", capKm * 0.35,
+    `${Math.round(capKm * 0.35)}km Z0 progressif — ${fmtPace(z0)} à ${fmtPace(z0 - 15)} sur les derniers kms`));
+
+  return sessions;
 }

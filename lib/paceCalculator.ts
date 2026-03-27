@@ -1,177 +1,188 @@
 // lib/paceCalculator.ts
-import type { PaceReference, TargetPaces, SessionType } from "./types";
+import type { PaceZones, PaceInstruction, DisciplineType, MicrocycleType } from "./types";
 
 // ── Formatage ─────────────────────────────────────────────────────────────────
 
-export function formatPace(secPerKm: number): string {
-  const min = Math.floor(secPerKm / 60);
-  const sec = Math.round(secPerKm % 60);
-  return `${min}'${sec.toString().padStart(2, "0")}"/km`;
+export function fmtPace(secPerKm: number): string {
+  const m = Math.floor(secPerKm / 60);
+  const s = Math.round(secPerKm % 60);
+  return `${m}'${s.toString().padStart(2, "0")}"/km`;
 }
 
-export function formatSwim(sec100m: number): string {
-  const min = Math.floor(sec100m / 60);
-  const sec = Math.round(sec100m % 60);
-  return `${min}'${sec.toString().padStart(2, "0")}"/100m`;
+export function fmtSwim(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return `${m}'${s.toString().padStart(2, "0")}"/100m`;
 }
 
-export function secPerKmFromMinKm(minKm: string): number {
-  // Accepte "5:30", "5'30", "5.5"
-  const cleaned = minKm.replace("'", ":").replace('"', "");
+export function fmtSpeed(kmh: number): string {
+  return `${kmh.toFixed(1)} km/h`;
+}
+
+export function parsePaceInput(str: string): number | undefined {
+  const cleaned = str.replace(/['"«»]/g, "").replace(",", ":").trim();
+  if (!cleaned) return undefined;
   if (cleaned.includes(":")) {
     const [m, s] = cleaned.split(":").map(Number);
-    return m * 60 + (s || 0);
+    if (isNaN(m) || isNaN(s)) return undefined;
+    return m * 60 + s;
   }
-  return parseFloat(cleaned) * 60;
+  const n = parseFloat(cleaned);
+  if (isNaN(n)) return undefined;
+  return Math.round(n * 60);
 }
 
-// ── Zones de course à pied ────────────────────────────────────────────────────
-// Basé sur l'allure de référence (ex: allure marathon ou 10km)
-// Z1 récup = +90s/km, Z2 endurance = +60s/km, Z3 tempo = +20s/km
-// Z4 seuil = ref, Z5 fractionné = -15s/km
+// ── Dériver toutes les zones depuis l'allure M-race ───────────────────────────
+// Si l'utilisateur ne donne que son allure M-race, on calcule les autres
 
-export function getRunPaces(ref: number, type: SessionType): string[] {
-  switch (type) {
+export function deriveZones(mRacePace: number): Partial<PaceZones> {
+  return {
+    m_runPace: mRacePace,
+    l_runPace: Math.round(mRacePace + 10),          // L-race = M + ~10s
+    xx_runPace: Math.round(mRacePace - 15),          // XX = M - 15s
+    x_runPace: Math.round(mRacePace + 50),           // X = M + 50s (5'20 si M=4'30)
+    z0_runPace: Math.round(mRacePace + 120),         // Z0 = M + 2min (6'30 si M=4'30)
+  };
+}
+
+export function deriveSwimZones(base100m: number): { easy: number; threshold: number; fast: number } {
+  return {
+    easy: Math.round(base100m + 15),
+    threshold: base100m,
+    fast: Math.round(base100m - 10),
+  };
+}
+
+// ── Instructions d'allure par discipline et microcycle ───────────────────────
+
+export function getRunPaces(zones: PaceZones, microcycle: MicrocycleType, subType?: string): PaceInstruction[] {
+  const z0 = zones.z0_runPace ?? 390;
+  const x = zones.x_runPace ?? 320;
+  const m = zones.m_runPace ?? 270;
+  const l = zones.l_runPace ?? 280;
+  const xx = zones.xx_runPace ?? 255;
+
+  switch (microcycle) {
     case "recup-active":
     case "repos":
-      return [`Allure très facile : ${formatPace(ref + 90)} à ${formatPace(ref + 120)}`];
-    case "endurance":
+      return [{ label: "Allure Z0 (fondamentale)", value: `${fmtPace(z0)} à ${fmtPace(z0 + 20)}`, zone: "Z0" }];
+
+    case "foncier":
       return [
-        `Allure Z2 (endurance) : ${formatPace(ref + 55)} à ${formatPace(ref + 70)}`,
-        `Respiration facile, conversation possible`,
+        { label: "Foncier Z0", value: `${fmtPace(z0)} à ${fmtPace(z0 + 15)}`, zone: "Z0" },
+        { label: "Long run dim", value: fmtPace(z0 + 10), zone: "Z0" },
       ];
-    case "longue-sortie":
-      return [
-        `Allure Z2 : ${formatPace(ref + 50)} à ${formatPace(ref + 75)}`,
-        `Restez confortable toute la sortie`,
+
+    case "rythme-X":
+      if (subType === "fartlek") return [
+        { label: "Allure X (fartlek)", value: fmtPace(x), zone: "X" },
+        { label: "Récup entre efforts", value: `${fmtPace(z0)} à ${fmtPace(z0 + 20)}`, zone: "Z0" },
       ];
-    case "seuil":
-      return [
-        `Allure seuil Z4 : ${formatPace(ref - 10)} à ${formatPace(ref + 5)}`,
-        `Respiration contrôlée mais soutenue`,
-        `FC : ~85–90% FC max`,
+      if (subType === "fractionne-M") return [
+        { label: "Allure M-race", value: fmtPace(m), zone: "M" },
+        { label: "Récupération", value: fmtPace(z0 + 30), zone: "Z0" },
       ];
-    case "fractionne":
       return [
-        `400m : ~${formatPace(ref - 25)} (allure 5km)`,
-        `1000m : ~${formatPace(ref - 15)}`,
-        `Récup : trot à ${formatPace(ref + 80)}`,
+        { label: "Allure X", value: fmtPace(x), zone: "X" },
+        { label: "Allure M-race", value: fmtPace(m), zone: "M" },
+      ];
+
+    case "intensif-XX":
+      return [
+        { label: "Allure XX (intensif)", value: fmtPace(xx), zone: "XX" },
+        { label: "Allure M-race", value: fmtPace(m), zone: "M" },
+        { label: "Récupération Z0", value: fmtPace(z0), zone: "Z0" },
+      ];
+
+    case "affutage":
+      return [
+        { label: "Séances vives X", value: fmtPace(x), zone: "X" },
+        { label: "Footing récup", value: fmtPace(z0 + 10), zone: "Z0" },
+      ];
+
+    case "competition":
+      return [
+        { label: "Allure race M", value: fmtPace(m), zone: "M" },
+        { label: "Allure race L", value: fmtPace(l), zone: "L" },
+      ];
+  }
+}
+
+export function getSwimPaces(zones: PaceZones, microcycle: MicrocycleType): PaceInstruction[] {
+  const base = zones.swimPace100m ?? 105;
+  const z = deriveSwimZones(base);
+
+  switch (microcycle) {
+    case "recup-active":
+    case "repos":
+      return [{ label: "Technique / récup", value: fmtSwim(z.easy + 10), zone: "Z0" }];
+    case "foncier":
+      return [
+        { label: "Endurance", value: fmtSwim(z.easy), zone: "Z0–Z1" },
+        { label: "Seuil", value: fmtSwim(z.threshold), zone: "Z3" },
+      ];
+    case "rythme-X":
+    case "intensif-XX":
+      return [
+        { label: "Seuil", value: fmtSwim(z.threshold), zone: "Z3" },
+        { label: "Effort rapide", value: fmtSwim(z.fast), zone: "Z4" },
+        { label: "Récupération", value: fmtSwim(z.easy + 5), zone: "Z1" },
+      ];
+    case "affutage":
+    case "competition":
+      return [
+        { label: "Activation", value: fmtSwim(z.easy), zone: "Z1" },
+        { label: "Allure race", value: fmtSwim(z.threshold - 5), zone: "Z3" },
       ];
     default:
-      return [`Allure modérée : ${formatPace(ref + 30)}`];
+      return [{ label: "Allure confortable", value: fmtSwim(z.easy), zone: "Z1" }];
   }
 }
 
-// ── Zones natation ────────────────────────────────────────────────────────────
-// Z2 = +15s/100m, seuil = ref, rapide = -10s/100m
+export function getBikePaces(zones: PaceZones, microcycle: MicrocycleType, subType?: string): PaceInstruction[] {
+  const spd = zones.bikeSpeedKmh ?? 30;
+  const ftp = zones.bikeFTPWatts;
 
-export function getSwimPaces(ref: number, type: SessionType): string[] {
-  switch (type) {
-    case "natation":
-      if (type === "natation") {
-        return [
-          `Endurance : ${formatSwim(ref + 15)} à ${formatSwim(ref + 20)}`,
-          `Seuil : ${formatSwim(ref)} à ${formatSwim(ref + 5)}`,
-          `Sprint (50m) : ~${formatSwim(ref - 12)}`,
-        ];
-      }
-      return [`${formatSwim(ref + 10)}`];
-    default:
-      return [`Allure confortable : ${formatSwim(ref + 15)}`];
-  }
-}
+  const z2Spd = Math.round(spd * 0.80);
+  const z3Spd = Math.round(spd * 0.88);
+  const z4Spd = Math.round(spd * 0.96);
+  const z5Spd = Math.round(spd * 1.05);
 
-// ── Zones vélo ────────────────────────────────────────────────────────────────
+  const ftpStr = (ratio: number) => ftp ? ` · ${Math.round(ftp * ratio)}W` : "";
 
-export function getBikePaces(speedKmh: number, ftpWatts: number | undefined, type: SessionType): string[] {
-  const z2Speed = Math.round(speedKmh * 0.82);
-  const z3Speed = Math.round(speedKmh * 0.90);
-  const z4Speed = Math.round(speedKmh * 0.97);
-  const z5Speed = Math.round(speedKmh * 1.05);
-
-  const ftpLines = ftpWatts
-    ? [
-        `FTP : ${ftpWatts}W → Z2: ${Math.round(ftpWatts * 0.60)}–${Math.round(ftpWatts * 0.75)}W`,
-        `Z4 seuil: ${Math.round(ftpWatts * 0.91)}–${Math.round(ftpWatts * 1.05)}W`,
-      ]
-    : [];
-
-  switch (type) {
-    case "velo":
-    case "endurance":
+  switch (microcycle) {
+    case "recup-active":
+    case "repos":
       return [
-        `Z2 endurance : ~${z2Speed}–${z3Speed} km/h`,
-        `Cadence cible : 85–95 rpm`,
-        ...ftpLines,
+        { label: "Z0 vélocité", value: `${fmtSpeed(z2Spd - 5)}${ftpStr(0.55)} · 90+ rpm`, zone: "Z0" },
       ];
-    case "seuil":
+    case "foncier":
       return [
-        `Z4 seuil : ~${z4Speed} km/h`,
-        `Effort soutenu, respiration contrôlée`,
-        ...(ftpWatts ? [`Watts cible : ${Math.round(ftpWatts * 0.91)}–${Math.round(ftpWatts * 1.05)}W`] : []),
+        { label: "HT vélocité (una pierna)", value: `${fmtSpeed(z2Spd)}${ftpStr(0.65)} · 90 rpm`, zone: "Z2" },
+        { label: "Sortie longue Z2", value: `${fmtSpeed(z2Spd)}–${fmtSpeed(z3Spd)}${ftpStr(0.72)}`, zone: "Z2" },
       ];
-    case "fractionne":
-      return [
-        `Intervalles Z5 : ~${z5Speed} km/h`,
-        `Récup Z1 : ~${Math.round(speedKmh * 0.60)} km/h`,
-        ...(ftpWatts ? [`Watts cible : >${Math.round(ftpWatts * 1.06)}W`] : []),
+    case "rythme-X":
+      if (subType === "ht") return [
+        { label: "HT una pierna (1 jambe)", value: `${fmtSpeed(z2Spd)}${ftpStr(0.65)}`, zone: "Z2" },
+        { label: "Séries X", value: `${fmtSpeed(z4Spd)}${ftpStr(0.92)}`, zone: "Z4" },
       ];
-    case "longue-sortie":
       return [
-        `Z2 constant : ~${z2Speed}–${z3Speed} km/h`,
-        `Nutrition : 1 gel toutes les 45min`,
+        { label: "HT vélocité", value: `${fmtSpeed(z2Spd)}${ftpStr(0.65)}`, zone: "Z2" },
+        { label: "Effort Z3", value: `${fmtSpeed(z3Spd)}${ftpStr(0.82)}`, zone: "Z3" },
       ];
-    case "brique":
+    case "intensif-XX":
       return [
-        `Vélo Z3 : ~${z3Speed} km/h`,
-        `→ Transition rapide`,
-        `Cap Z2 : ${formatPace(Math.round(speedKmh > 0 ? 3600 / (speedKmh * 0.25) : 360))}`,
+        { label: "HT séries XX", value: `${fmtSpeed(z5Spd)}${ftpStr(1.10)}`, zone: "Z5" },
+        { label: "Récupération", value: `${fmtSpeed(z2Spd - 3)}${ftpStr(0.55)}`, zone: "Z1" },
+        ...(ftp ? [{ label: "FTP (seuil)", value: `${fmtSpeed(z4Spd)}${ftpStr(0.95)}`, zone: "Z4" }] : []),
+      ];
+    case "affutage":
+    case "competition":
+      return [
+        { label: "Activation", value: `${fmtSpeed(z2Spd)}${ftpStr(0.60)}`, zone: "Z2" },
+        { label: "Séances vives X", value: `${fmtSpeed(z4Spd)}${ftpStr(0.90)}`, zone: "Z4" },
       ];
     default:
-      return [`Allure modérée : ~${z2Speed} km/h`];
+      return [{ label: "Endurance Z2", value: `${fmtSpeed(z2Spd)}${ftpStr(0.65)}`, zone: "Z2" }];
   }
-}
-
-// ── Calcul allures triathlon ──────────────────────────────────────────────────
-
-export function getTriPaces(ref: PaceReference, type: SessionType): string[] {
-  const lines: string[] = [];
-
-  if (type === "natation" && ref.swimPaceSec100m) {
-    return getSwimPaces(ref.swimPaceSec100m, type);
-  }
-
-  if ((type === "velo" || type === "brique") && ref.bikeSpeedKmh) {
-    return getBikePaces(ref.bikeSpeedKmh, ref.bikeFTPWatts, type);
-  }
-
-  if (ref.runPaceSecPerKm) {
-    return getRunPaces(ref.runPaceSecPerKm, type);
-  }
-
-  return lines;
-}
-
-// ── Point d'entrée principal ──────────────────────────────────────────────────
-
-export function computeTargetPaces(
-  sport: string,
-  type: SessionType,
-  ref: PaceReference
-): TargetPaces {
-  let lines: string[] = [];
-
-  if (sport === "marathon" || sport === "semi-marathon") {
-    if (ref.runPaceSecPerKm) {
-      lines = getRunPaces(ref.runPaceSecPerKm, type);
-    }
-  } else if (sport === "velo") {
-    if (ref.bikeSpeedKmh) {
-      lines = getBikePaces(ref.bikeSpeedKmh, ref.bikeFTPWatts, type);
-    }
-  } else if (sport === "triathlon") {
-    lines = getTriPaces(ref, type);
-  }
-
-  return { lines };
 }
